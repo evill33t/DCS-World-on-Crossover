@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce the DCS/CrossOver setup that worked on 12 October 2026.
+"""Configure standalone DCS World for CrossOver with D3DMetal, DLSS support and compatibility guards.
 
 Python 3.9+, standard library only. See DCS-CrossOver-clean-install.md.
 No game files, credentials, or licensed binaries are included in this package.
@@ -12,7 +12,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -26,6 +28,20 @@ OVERRIDES = {'wbemprox': 'native', 'msdmo': 'native',
              'winhttp': 'native,builtin', 'd3dcompiler_47': 'native,builtin'}
 PREFERENCES = {'launcher': 'false', 'collect_stat': 'false',
                'collect_stat_defined': 'true', 'push_starthere': 'false'}
+APACHE_FONT = 'seguisym.ttf'
+MULTIPLAYER_FILE = Path('MissionEditor/modules/mul_voicechat.lua')
+SLOT_SIGNATURE = b'function onPlayerChangeSlot(id)'
+SLOT_GUARD = (b'\t-- VoiceChat may be unavailable under Wine/CrossOver.\n'
+              b'\tif voice_chat == nil then\n\t\treturn\n\tend\n')
+SLOT_BODY = b'\tif ((DCS.isMultiplayer() == true) and (DCS.isTrackPlaying() ~= true)) then'
+D3DM_ORIGINAL_SHA256 = 'e66f5b1c8a2f22b909ddeddbd3e12049a58962035aeb544b32e5314509c54ae3'
+D3DM_PATCHED_SHA256 = '389ffe5eb81341092ce3004eb4b86bfbfe3b7cf3dfb143b212223e7e8e968697'
+D3DM_OFFSET = 0x1A83F
+D3DM_ORIGINAL_BYTES = bytes.fromhex('488b8c24980000004885c97462')
+D3DM_PATCHED_BYTES = bytes.fromhex('85c0786b488b8c249800000090')
+D3DM_BACKUP_SUFFIX = '.d3dmetal-original-2.9.30.28738'
+# Integrated from the user-supplied DCS-D3DMetal-Patch-2.9.30.28738.zip.
+# ZIP SHA-256: 48451e6251f62f4b4b1c68f6046969c5bb62eecc0ed8dbb0e0e6069456e25ef9
 COMPILERS = {
     'system32': ('d3dcompiler_47.dll',
                  '4432bbd1a390874f3f0a503d45cc48d346abc3a8c0213c289f4b615bf0ee84f3'),
@@ -67,6 +83,111 @@ def native_dll(path):
     with path.open('rb') as stream:
         header = stream.read(4096)
     return header[:2] == b'MZ' and b'Wine builtin DLL' not in header
+
+
+def validate_apache_font(data):
+    """Reject wrong fonts and malformed TrueType name tables before copying."""
+    try:
+        if len(data) < 12 or data[:4] != b'\x00\x01\x00\x00':
+            raise ValueError('Not a TrueType font')
+        count = struct.unpack_from('>H', data, 4)[0]
+        if 12 + count * 16 > len(data):
+            raise ValueError('Truncated TrueType table directory')
+        for i in range(count):
+            tag, _, offset, length = struct.unpack_from('>4sIII', data, 12 + i * 16)
+            if tag != b'name':
+                continue
+            if offset + length > len(data):
+                raise ValueError('Truncated font name table')
+            table = data[offset:offset + length]
+            _, records, strings = struct.unpack_from('>HHH', table)
+            if 6 + records * 12 > strings or strings > len(table):
+                raise ValueError('Invalid font name records')
+            for j in range(records):
+                platform, _, _, name_id, size, start = struct.unpack_from('>HHHHHH', table, 6 + j * 12)
+                if strings + start + size > len(table):
+                    raise ValueError('Truncated font name string')
+                if name_id in (1, 4, 16):
+                    raw = table[strings + start:strings + start + size]
+                    name = raw.decode('utf-16-be' if platform in (0, 3) else 'latin-1')
+                    if name == 'Segoe UI Symbol':
+                        return
+        raise ValueError('Expected the Segoe UI Symbol font family')
+    except (ValueError, struct.error, UnicodeError) as error:
+        raise SetupError('Invalid ' + APACHE_FONT + ': ' + str(error)) from error
+
+
+def font_directory(bottle):
+    windows = bottle / 'drive_c/windows'
+    matches = [p for p in windows.iterdir() if p.name.lower() == 'fonts'] if windows.is_dir() else []
+    if len(matches) > 1:
+        raise SetupError('Multiple Windows Fonts directories found.')
+    directory = matches[0] if matches else windows / 'Fonts'
+    if not directory.resolve().is_relative_to(bottle):
+        raise SetupError('Windows Fonts directory points outside this bottle.')
+    return directory
+
+
+def apache_font_path(bottle):
+    directory = font_directory(bottle)
+    matches = [p for p in directory.iterdir() if p.name.lower() == APACHE_FONT] if directory.is_dir() else []
+    if len(matches) > 1:
+        raise SetupError('Multiple Segoe UI Symbol font files found.')
+    target = matches[0] if matches else directory / APACHE_FONT
+    if target.is_symlink():
+        raise SetupError('Refusing a linked Segoe UI Symbol font.')
+    return target
+
+
+def local_apache_font(explicit=None):
+    if explicit:
+        candidates = [Path(explicit).expanduser().resolve()]
+    else:
+        candidates = [Path('/Applications') / (app + '.app') / 'Contents/Resources/DFonts' / APACHE_FONT
+                      for app in ('Microsoft Word', 'Microsoft Excel', 'Microsoft PowerPoint')]
+    for path in candidates:
+        if path.is_file():
+            data = path.read_bytes()
+            validate_apache_font(data)
+            return data
+    raise SetupError('Segoe UI Symbol is missing. Install Office locally or pass --font /path/to/seguisym.ttf. '
+                     'No Microsoft font is bundled or downloaded by this tool.')
+
+
+def multiplayer_parts(data):
+    matches = list(re.finditer(rb'(?m)^' + re.escape(SLOT_SIGNATURE) + rb'(\r?\n)', data))
+    if len(matches) != 1 or b"base.safe_require('VoiceChat')" not in data:
+        raise SetupError('Unrecognized mul_voicechat.lua; expected one VoiceChat slot callback. File left unchanged.')
+    match = matches[0]
+    return data[:match.end()], data[match.end():], SLOT_GUARD.replace(b'\n', match[1])
+
+
+def patch_multiplayer(data):
+    before, after, guard = multiplayer_parts(data)
+    body = after[len(guard):] if after.startswith(guard) else after
+    if not body.splitlines() or body.splitlines()[0] != SLOT_BODY:
+        raise SetupError('Unrecognized onPlayerChangeSlot body; file left unchanged. Review this DCS version first.')
+    return before + guard + body
+
+
+def patch_d3dmetal(data):
+    """Guard QueryInterface's HRESULT in the exact supported DCS renderer only."""
+    digest = hashlib.sha256(data).hexdigest()
+    if digest == D3DM_PATCHED_SHA256:
+        if data[D3DM_OFFSET:D3DM_OFFSET + len(D3DM_PATCHED_BYTES)] != D3DM_PATCHED_BYTES:
+            raise SetupError('D3DMetal patch bytes do not match their checksum record.')
+        return data
+    if digest != D3DM_ORIGINAL_SHA256:
+        raise SetupError('Unsupported dx11backend.dll for the D3DMetal patch. Nothing was patched. '
+                         'Only the verified DCS 2.9.30.28738 renderer is supported; '
+                         'do not copy an older DLL over an update. Use --graphics dxmt to skip this patch.')
+    if data[D3DM_OFFSET:D3DM_OFFSET + len(D3DM_ORIGINAL_BYTES)] != D3DM_ORIGINAL_BYTES:
+        raise SetupError('D3DMetal patch location does not match; nothing was patched.')
+    patched = (data[:D3DM_OFFSET] + D3DM_PATCHED_BYTES
+               + data[D3DM_OFFSET + len(D3DM_ORIGINAL_BYTES):])
+    if hashlib.sha256(patched).hexdigest() != D3DM_PATCHED_SHA256:
+        raise SetupError('D3DMetal patched renderer checksum does not match; nothing was patched.')
+    return patched
 
 
 def registry_section(path, section):
@@ -112,13 +233,16 @@ def conf_values(text, section):
     return result
 
 
-def patch_conf(text):
+def patch_conf(text, graphics='dxmt'):
     newline = '\r\n' if '\r\n' in text else '\n'
     sections = list(re.finditer(r'(?m)^\s*\[([^]\r\n]+)\][ \t]*\r?$', text))
     found = [i for i, match in enumerate(sections) if match[1] == 'EnvironmentVariables']
     if len(found) > 1:
         raise SetupError('Duplicate EnvironmentVariables sections')
-    wanted = {'CX_GRAPHICS_BACKEND': 'dxmt', 'WINEMSYNC': '1'}
+    wanted = {'CX_GRAPHICS_BACKEND': graphics, 'WINEMSYNC': '1'}
+    if graphics == 'd3dmetal':
+        # These are the two keys controlled by CrossOver 26's DLSS switch.
+        wanted.update(D3DM_ENABLE_METALFX='1', DXMT_ENABLE_NVEXT='1')
     if not found:
         return text.rstrip('\r\n') + newline * 2 + '[EnvironmentVariables]' + newline + ''.join(
             '"' + key + '" = "' + value + '"' + newline for key, value in wanted.items())
@@ -303,7 +427,7 @@ def dependency_problems(bottle):
         path = bottle / 'drive_c/windows' / directory / 'd3dcompiler_47.dll'
         if not native_dll(path):
             problems.append('Native d3dcompiler_47 missing in ' + directory)
-    font_dir = bottle / 'drive_c/windows/fonts'
+    font_dir = font_directory(bottle)
     names = {path.name.lower() for path in font_dir.iterdir()} if font_dir.is_dir() else set()
     if not {'arial.ttf', 'times.ttf', 'cour.ttf', 'verdana.ttf'}.issubset(names):
         problems.append('Microsoft core fonts missing')
@@ -318,10 +442,15 @@ class Setup:
         self.env = os.environ.copy()
         self.env['CX_BOTTLE_PATH'] = str(self.bottle.parent)
         # Ensure shell-level experimental overrides cannot defeat the bottle configuration.
-        for name in ('WINEDLLOVERRIDES', 'CX_GRAPHICS_BACKEND', 'WINEMSYNC'):
+        for name in ('WINEDLLOVERRIDES', 'CX_GRAPHICS_BACKEND', 'WINEMSYNC',
+                     'D3DM_ENABLE_METALFX', 'DXMT_ENABLE_NVEXT'):
             self.env.pop(name, None)
         self.backup = None
         self.records = []
+
+    @property
+    def graphics_backend(self):
+        return getattr(self.args, 'graphics', 'd3dmetal')
 
     def run(self, command, timeout=300, allowed=(0,)):
         result = subprocess.run([str(part) for part in command], env=self.env,
@@ -375,13 +504,187 @@ class Setup:
         if path.read_bytes() != data:
             raise SetupError('Could not verify file: ' + str(path))
 
+    def remove(self, path):
+        old = path.read_bytes()
+        self.begin_backup()
+        backup_file = str(len(self.records)) + '-' + path.name
+        (self.backup / backup_file).write_bytes(old)
+        self.records.append({'path': str(path), 'backup': backup_file, 'created': False,
+                             'deleted': True, 'after_sha256': None})
+        self.save_manifest()
+        if path.read_bytes() != old:
+            raise SetupError('File changed during setup: ' + str(path))
+        path.unlink()
+
+    def compatibility_plan(self, game):
+        target = apache_font_path(self.bottle)
+        if target.exists():
+            validate_apache_font(target.read_bytes())
+            font_data = None  # Retain pre-existing valid fonts, regardless of their source.
+        else:
+            font_data = local_apache_font(self.args.font)
+        multiplayer = game / MULTIPLAYER_FILE
+        if multiplayer.is_symlink():
+            raise SetupError('Refusing a linked mul_voicechat.lua.')
+        patched = patch_multiplayer(multiplayer.read_bytes())
+        return target, font_data, multiplayer, patched
+
+    def launch_logged(self, dry_run=False, backend=None):
+        """Run an explicitly requested reproduction without applying any fixes."""
+        game = find_game(self.bottle, self.args.game_dir)
+        profile = find_profile(self.bottle, self.args.profile)
+        wine = self.runtime / 'bin/wine'
+        if not wine.is_file():
+            raise SetupError('CrossOver executable not found: ' + str(wine))
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        folder = self.bottle / '.dcs-crossover-setup/diagnostics' / (stamp + '-' + uuid.uuid4().hex[:8])
+        config = conf_values((self.bottle / 'cxbottle.conf').read_text(), 'EnvironmentVariables')
+        environment = []
+        if backend:
+            environment.append('CX_GRAPHICS_BACKEND=' + backend)
+        command = [str(wine), '--bottle', str(self.bottle), '--no-update', '--wait',
+                   '--workdir', windows_path(game), '--cx-log', str(folder / 'CrossOver.cxlog'),
+                   '--debugmsg', '+seh,+tid,+loaddll']
+        if environment:
+            command += ['--env', shlex.join(environment)]
+        command += ['--cx-app', windows_path(game / 'bin/DCS.exe'), '--', '--no-launcher']
+        print('Diagnostic log directory: ' + str(folder), flush=True)
+        if dry_run:
+            print('DRY RUN; no files changed and no processes launched.')
+            print(shlex.join(command))
+            return 0
+        folder.mkdir(parents=True, exist_ok=False)
+        log = profile / 'Logs/dcs.log'
+        if log.is_file():
+            shutil.copy2(log, folder / 'dcs-before.log')
+        metadata = {'bottle': str(self.bottle), 'game': str(game), 'profile': str(profile),
+                    'command': command, 'environment': {key: config.get(key) for key in
+                                                       ('CX_GRAPHICS_BACKEND', 'WINEMSYNC',
+                                                        'D3DM_ENABLE_METALFX', 'DXMT_ENABLE_NVEXT')}}
+        renderer = game / 'bin/dx11backend.dll'
+        metadata['renderer_sha256'] = sha256(renderer) if renderer.is_file() else None
+        metadata['bottle_graphics_backend'] = config.get('CX_GRAPHICS_BACKEND')
+        if backend:
+            metadata['environment']['CX_GRAPHICS_BACKEND'] = backend
+        (folder / 'run.json').write_text(json.dumps(metadata, indent=2) + '\n')
+        print('Starting DCS with native exception and DLL logging. Retry the same Apache slot.', flush=True)
+        print('Keep this terminal open until DCS exits. No compatibility settings are changed by this mode.', flush=True)
+        result = None
+        try:
+            with (folder / 'launcher.log').open('wb') as output:
+                result = subprocess.run(command, cwd=game, env=self.env,
+                                        stdout=output, stderr=subprocess.STDOUT)
+            metadata['exit_code'] = result.returncode
+            (folder / 'run.json').write_text(json.dumps(metadata, indent=2) + '\n')
+            print('DCS launcher exited with code ' + str(result.returncode) + '.', flush=True)
+            return result.returncode
+        finally:
+            if log.is_file():
+                shutil.copy2(log, folder / 'dcs-after.log')
+            print('Diagnostic files saved in: ' + str(folder), flush=True)
+
+    def backup_original(self, target, current):
+        """Find a matching main-setup backup, never trust arbitrary manifest paths."""
+        digest = hashlib.sha256(current).hexdigest()
+        folder = self.bottle / '.dcs-crossover-setup/backups'
+        for manifest in sorted(folder.glob('*/manifest.json'), reverse=True):
+            document = json.loads(manifest.read_text())
+            for record in reversed(document.get('files', [])):
+                if record.get('path') != str(target) or record.get('after_sha256') != digest:
+                    continue
+                if record.get('created') is True:
+                    return True, None
+                name = record.get('backup')
+                if not isinstance(name, str) or Path(name).name != name:
+                    raise SetupError('Invalid backup entry in ' + str(manifest))
+                backup = manifest.parent / name
+                if backup.is_symlink():
+                    raise SetupError('Refusing a linked backup: ' + str(backup))
+                return True, backup.read_bytes()
+        return False, None
+
+    def undo_compatibility(self, dry_run=False):
+        game = find_game(self.bottle, self.args.game_dir)
+        target = game / MULTIPLAYER_FILE
+        if target.is_symlink():
+            raise SetupError('Refusing a linked mul_voicechat.lua.')
+        data = target.read_bytes()
+        before, after, guard = multiplayer_parts(data)
+        plan = []
+        renderer = game / 'bin/dx11backend.dll'
+        if renderer.is_symlink():
+            raise SetupError('Refusing a linked dx11backend.dll.')
+        if renderer.is_file():
+            current = renderer.read_bytes()
+            if hashlib.sha256(current).hexdigest() == D3DM_PATCHED_SHA256:
+                found, saved = self.backup_original(renderer, current)
+                legacy = renderer.with_name(renderer.name + D3DM_BACKUP_SUFFIX)
+                if not found and legacy.is_file() and not legacy.is_symlink():
+                    found, saved = True, legacy.read_bytes()
+                if not found or saved is None or hashlib.sha256(saved).hexdigest() != D3DM_ORIGINAL_SHA256:
+                    raise SetupError('No matching original D3DMetal renderer backup; nothing changed.')
+                plan.append((renderer, saved))
+                config = self.bottle / 'cxbottle.conf'
+                text = config.read_text()
+                if conf_values(text, 'EnvironmentVariables').get('CX_GRAPHICS_BACKEND') == 'd3dmetal':
+                    plan.append((config, patch_conf(text, 'dxmt').encode('utf-8')))
+            else:
+                # A game update owns its new renderer; never restore an older DLL over it.
+                print('Keeping original or updated renderer; D3DMetal patch is not active.')
+        if after.startswith(guard):
+            patch_multiplayer(data)  # Validate the remainder of the callback too.
+            original = before + after[len(guard):]
+            found, saved = self.backup_original(target, data)
+            if not found:
+                # Retain undo for installations made with the former separate patch.
+                digest = hashlib.sha256(original).hexdigest()[:12]
+                legacy = target.with_name(target.name + '.blue-coalition-' + digest + '.bak')
+                saved = legacy.read_bytes() if legacy.is_file() and not legacy.is_symlink() else None
+            if saved != original:
+                raise SetupError('Matching unmodified multiplayer backup not found; nothing changed.')
+            plan.append((target, saved))
+        font = apache_font_path(self.bottle)
+        if font.is_file():
+            current = font.read_bytes()
+            found, saved = self.backup_original(font, current)
+            legacy = self.bottle / '.dcs-crossover-setup/apache-font.json'
+            if not found and legacy.is_file():
+                record = json.loads(legacy.read_text())
+                if record.get('version') != 1 or record.get('font') != APACHE_FONT:
+                    raise SetupError('Unrecognized legacy font receipt; nothing changed.')
+                if record.get('sha256') != hashlib.sha256(current).hexdigest():
+                    raise SetupError('Font changed since installation; nothing changed.')
+                found, saved = True, None
+            if found:
+                plan.append((font, saved))
+            else:
+                # A manifest proves ownership even if someone subsequently changed the font.
+                folder = self.bottle / '.dcs-crossover-setup/backups'
+                if any(any(r.get('path') == str(font) and r.get('created') is True
+                           for r in json.loads(p.read_text()).get('files', []))
+                       for p in folder.glob('*/manifest.json')):
+                    raise SetupError('Font differs from its setup backup record; nothing changed.')
+                print('Keeping pre-existing Segoe UI Symbol font; no setup ownership record.')
+        # Preflight the renderer, configuration, Lua, and font before changing any.
+        for path, restored in plan:
+            print(('Would remove ' if restored is None else 'Would restore ') + str(path))
+        if dry_run:
+            return 0
+        for path, restored in plan:
+            if restored is None:
+                self.remove(path)
+            else:
+                self.replace(path, restored)
+        print('Compatibility fixes undone.' if plan else 'No installed compatibility fixes to undo.')
+        return 0
+
     def graphics(self):
         path = self.bottle / 'cxbottle.conf'
         original = path.read_bytes()
         text = original.decode('utf-8')
         if conf_values(text, 'Bottle').get('Template') != 'win10_64':
             raise SetupError('This script requires a Windows 10 64-bit bottle (win10_64).')
-        self.replace(path, patch_conf(text).encode('utf-8'))
+        self.replace(path, patch_conf(text, self.graphics_backend).encode('utf-8'))
 
     def overrides(self):
         self.begin_backup()
@@ -468,7 +771,7 @@ class Setup:
                 continue
             source = self.download(name, 'https://raw.githubusercontent.com/mozilla/fxc2/master/dll/' + name, digest)
             self.replace(destination, source.read_bytes())
-        font_dir = self.bottle / 'drive_c/windows/fonts'
+        font_dir = font_directory(self.bottle)
         installed_fonts = set()
         for name, digest in FONTS.items():
             source = self.download(name, 'https://raw.githubusercontent.com/pushcx/corefonts/master/' + name, digest)
@@ -495,9 +798,29 @@ class Setup:
             raise SetupError('No stock or profile options.lua found: ' + str(source))
         # Validate the entire patch before changing the bottle or registry.
         patched = patch_options(source.read_bytes().decode('utf-8-sig')).encode('utf-8')
+        font, font_data, multiplayer, multiplayer_data = self.compatibility_plan(game)
+        renderer = game / 'bin/dx11backend.dll'
+        renderer_data = None
+        if self.graphics_backend == 'd3dmetal':
+            if renderer.is_symlink():
+                raise SetupError('Refusing a linked dx11backend.dll.')
+            original_renderer = renderer.read_bytes()
+            renderer_data = patch_d3dmetal(original_renderer)
         self.graphics()
         self.overrides()
+        if renderer_data is not None:
+            if renderer.read_bytes() != original_renderer:
+                raise SetupError('Renderer changed during setup. Close DCS and its updater, then retry.')
+            self.replace(renderer, renderer_data)
+            print('D3DMetal startup guard verified; CrossOver DLSS bridge enabled.')
         self.replace(options, patched)
+        if font_data is not None:
+            self.replace(font, font_data)
+            print('Installed Segoe UI Symbol for Apache cockpit loading.')
+        else:
+            print('Segoe UI Symbol already installed.')
+        self.replace(multiplayer, multiplayer_data)
+        print('Multiplayer slot/coalition VoiceChat guard verified.')
         print('DCS preferences configured: ' + str(options))
         print('Launch DCS.exe from CrossOver. Leave the Start Here button closed.')
 
@@ -510,7 +833,10 @@ class Setup:
         if conf_values(text, 'Bottle').get('Template') != 'win10_64':
             problems.append('Bottle is not Windows 10 64-bit')
         environment = conf_values(text, 'EnvironmentVariables')
-        for key, value in (('CX_GRAPHICS_BACKEND', 'dxmt'), ('WINEMSYNC', '1')):
+        wanted = {'CX_GRAPHICS_BACKEND': self.graphics_backend, 'WINEMSYNC': '1'}
+        if self.graphics_backend == 'd3dmetal':
+            wanted.update(D3DM_ENABLE_METALFX='1', DXMT_ENABLE_NVEXT='1')
+        for key, value in wanted.items():
             if environment.get(key) != value:
                 problems.append(key + ' should be ' + value)
         values = registry_section(self.bottle / 'user.reg', r'Software\Wine\DllOverrides')
@@ -522,13 +848,32 @@ class Setup:
                 problems.append('Remove experimental empty ' + key + ' override')
         problems.extend(dependency_problems(self.bottle))
         try:
+            font = apache_font_path(self.bottle)
+            if not font.is_file():
+                raise SetupError('Segoe UI Symbol missing: rerun setup (use --font if Office is not installed).')
+            validate_apache_font(font.read_bytes())
+        except (SetupError, OSError) as error:
+            problems.append(str(error))
+        try:
             game = find_game(self.bottle, self.args.game_dir)
+            multiplayer = game / MULTIPLAYER_FILE
+            data = multiplayer.read_bytes()
+            if patch_multiplayer(data) != data:
+                problems.append('Multiplayer slot/coalition VoiceChat guard missing; rerun setup.')
+            print('DCS installation: ' + str(game))
+            if self.graphics_backend == 'd3dmetal':
+                renderer = game / 'bin/dx11backend.dll'
+                data = renderer.read_bytes()
+                if patch_d3dmetal(data) != data:
+                    problems.append('D3DMetal startup guard missing; rerun setup.')
+        except (SetupError, OSError) as error:
+            problems.append(str(error))
+        try:
             profile = find_profile(self.bottle, self.args.profile)
             preferences = preference_values((profile / 'Config/options.lua').read_bytes().decode('utf-8-sig'))
             for key, value in PREFERENCES.items():
                 if preferences.get(key) != value:
                     problems.append('miscellaneous.' + key + ' should be ' + value)
-            print('DCS installation: ' + str(game))
         except (SetupError, FileNotFoundError) as error:
             problems.append(str(error))
         print('Bottle: ' + str(self.bottle))
@@ -536,7 +881,8 @@ class Setup:
             for problem in problems:
                 print('  NEEDS ATTENTION: ' + problem)
             return 1
-        print('PASS: bottle, prerequisites, DLL overrides, and startup preferences match.')
+        print('PASS (configuration only): ' + self.graphics_backend + ' recipe, prerequisites, DLL overrides, '
+              'startup preferences, Apache font, and multiplayer guard match.')
         return 0
 
 
@@ -544,14 +890,25 @@ def windows_path(path):
     return 'Z:' + str(Path(path).resolve()).replace('/', '\\')
 
 
+def ensure_dcs_closed():
+    process_list = subprocess.run(['/bin/ps', '-axo', 'comm='], capture_output=True, text=True)
+    if process_list.returncode != 0:
+        raise SetupError('Cannot check running processes. Run this script in Terminal outside a sandbox.')
+    if any(line.strip().replace('\\', '/').rsplit('/', 1)[-1].lower() in ('dcs.exe', 'dcs_updater.exe', 'edcefrenderprocess.exe')
+           for line in process_list.stdout.splitlines()):
+        raise SetupError('Close DCS, its updater, and browser windows before running setup.')
+
+
 def wizard(args):
     print('DCS World / CrossOver setup\n')
     print('1. Clean install into a new Windows 10 64-bit bottle')
-    print('2. Configure an existing DCS bottle')
+    print('2. Apply all fixes to an existing DCS bottle')
     print('3. Check an existing bottle without changing anything')
+    print('4. Undo the renderer/multiplayer guards and owned Apache font')
+    print('5. Launch DCS with native crash logging (no setup changes)')
     choice = input('Choice [1]: ').strip() or '1'
-    if choice not in ('1', '2', '3'):
-        raise SetupError('Choose 1, 2, or 3')
+    if choice not in ('1', '2', '3', '4', '5'):
+        raise SetupError('Choose 1, 2, 3, 4, or 5')
     args.bottle = input('Full Mac path to bottle [' + str(DEFAULT_BOTTLE) + ']: ').strip().strip('"\'') or str(DEFAULT_BOTTLE)
     args.bottle = re.sub(r'\\([ ()])', r'\1', args.bottle)
     if choice == '1':
@@ -563,8 +920,16 @@ def wizard(args):
             args.resume = input('Bottle exists. Resume installation in it? [y/N]: ').strip().lower() == 'y'
     elif choice == '2':
         args.dependencies = input('Also download/install missing prerequisites and core fonts? [Y/n]: ').strip().lower() != 'n'
-    else:
+    elif choice == '3':
         args.check = True
+    elif choice == '4':
+        args.undo_compatibility = True
+    else:
+        args.launch_log = True
+    if choice in ('1', '2'):
+        entered = input('Optional path to seguisym.ttf [use installed font or local Office copy]: ').strip().strip('"\'')
+        if entered:
+            args.font = re.sub(r'\\([ ()])', r'\1', entered)
     return args
 
 
@@ -579,15 +944,44 @@ def main(argv=None):
     parser.add_argument('--dependencies', action='store_true', help='Install missing native runtimes, compilers, and core fonts')
     parser.add_argument('--game-dir', help='Full Mac path to a nonstandard DCS installation directory')
     parser.add_argument('--profile', help='Full Mac path to the Saved Games/DCS profile, if nonstandard')
-    parser.add_argument('--check', action='store_true', help='Read-only check; does not launch Wine or download files')
+    parser.add_argument('--font', help='Local Segoe UI Symbol seguisym.ttf; otherwise reuse the installed font or local Office copy')
+    parser.add_argument('--graphics', choices=('d3dmetal', 'dxmt'), default='d3dmetal',
+                        help='Setup/check recipe: D3DMetal with guarded renderer and DLSS bridge (default), or legacy DXMT')
+    parser.add_argument('--log-backend', choices=('dxmt', 'd3dmetal', 'dxvk'),
+                        help='Override the graphics backend for one --launch-log run only')
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument('--check', action='store_true', help='Read-only check of all fixes; no Wine or downloads')
+    actions.add_argument('--undo-compatibility', action='store_true',
+                         help='Restore the renderer/multiplayer guards and owned Apache font using matching backups')
+    actions.add_argument('--launch-log', action='store_true',
+                         help='Launch DCS with native crash logging; apply no setup changes (combine with --dry-run to preview)')
     parser.add_argument('--dry-run', action='store_true', help='Show planned actions; no changes, Wine, or downloads')
     parser.add_argument('--wizard', action='store_true', help='Interactive setup for the .command launcher')
     args = parser.parse_args(argv)
     if args.wizard:
         args = wizard(args)
     setup = Setup(args)
+    if args.log_backend and not args.launch_log:
+        raise SetupError('--log-backend requires --launch-log.')
     if args.check:
         return setup.check()
+    if args.launch_log:
+        if args.install or args.create or args.dependencies or args.installer:
+            raise SetupError('--launch-log cannot be combined with installation/dependency options.')
+        if not args.dry_run:
+            ensure_dcs_closed()
+        return setup.launch_logged(dry_run=args.dry_run, backend=args.log_backend)
+    if args.undo_compatibility:
+        if args.install or args.create or args.dependencies or args.installer:
+            raise SetupError('--undo-compatibility cannot be combined with installation/dependency options.')
+        if not args.dry_run:
+            ensure_dcs_closed()
+        try:
+            return setup.undo_compatibility(dry_run=args.dry_run)
+        finally:
+            if setup.backup:
+                setup.save_manifest()
+                print('Recovery backup: ' + str(setup.backup))
     if args.install and not args.installer:
         raise SetupError('--install requires --installer with the downloaded official DCS installer.')
     if args.installer and not args.install:
@@ -602,7 +996,23 @@ def main(argv=None):
         print('Create Windows 10 64-bit bottle if needed: ' + str(args.install or args.create))
         print('Download/install prerequisites: ' + str(args.install or args.dependencies))
         print('Run official DCS installer: ' + str(bool(args.installer)))
-        print('Configure DXMT, MSync, four DLL overrides, and four DCS preferences.')
+        print('Configure ' + args.graphics + ', MSync, four DLL overrides, and four DCS preferences.')
+        if args.graphics == 'd3dmetal':
+            print('Enable the CrossOver DLSS bridge and patch only the exact supported renderer (with backup).')
+            try:
+                renderer = find_game(setup.bottle, args.game_dir) / 'bin/dx11backend.dll'
+                if renderer.is_symlink():
+                    raise SetupError('Refusing a linked dx11backend.dll.')
+                patch_d3dmetal(renderer.read_bytes())
+                print('Renderer checksum matches the supported DCS 2.9.30.28738 original/patch.')
+            except SetupError:
+                if (setup.bottle / 'cxbottle.conf').exists() and not args.install:
+                    raise
+            except FileNotFoundError:
+                if not (args.install or args.create):
+                    raise SetupError('DCS renderer is missing; install DCS before configuring D3DMetal.')
+        print('Install missing Segoe UI Symbol from --font or local Office; keep an existing valid font.')
+        print('Apply the multiplayer slot/coalition guard only when the known callback needs it.')
         print('Back up modified files and selected DLL overrides inside the bottle.')
         return 0
     if sys.platform != 'darwin':
@@ -611,12 +1021,7 @@ def main(argv=None):
         if not (setup.runtime / 'bin' / executable).is_file():
             raise SetupError('CrossOver executable not found: ' + str(setup.runtime / 'bin' / executable))
     # Refuse to edit preferences while a game or installer is using them.
-    process_list = subprocess.run(['/bin/ps', '-axo', 'comm='], capture_output=True, text=True)
-    if process_list.returncode != 0:
-        raise SetupError('Cannot check running processes. Run this script in Terminal outside a sandbox.')
-    if any(Path(line.strip()).name.lower() in ('dcs.exe', 'dcs_updater.exe', 'edcefrenderprocess.exe')
-           for line in process_list.stdout.splitlines()):
-        raise SetupError('Close DCS, its updater, and browser windows before running setup.')
+    ensure_dcs_closed()
     try:
         if not (setup.bottle / 'cxbottle.conf').is_file():
             if not (args.create or args.install):
